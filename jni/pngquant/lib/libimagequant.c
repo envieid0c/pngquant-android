@@ -450,18 +450,11 @@ static bool liq_image_use_low_memory(liq_image *img)
 
 static bool liq_image_should_use_low_memory(liq_image *img, const bool low_memory_hint)
 {
-    return img->width * img->height * sizeof(f_pixel) > (low_memory_hint ? LIQ_HIGH_MEMORY_LIMIT/8 : LIQ_HIGH_MEMORY_LIMIT);
+    return img->width * img->height > (low_memory_hint ? LIQ_HIGH_MEMORY_LIMIT/8 : LIQ_HIGH_MEMORY_LIMIT) / sizeof(f_pixel); // Watch out for integer overflow
 }
 
 static liq_image *liq_image_create_internal(liq_attr *attr, rgba_pixel* rows[], liq_image_get_rgba_row_callback *row_callback, void *row_callback_user_info, int width, int height, double gamma)
 {
-    if (!CHECK_STRUCT_TYPE(attr, liq_attr)) {
-        return NULL;
-    }
-    if (width <= 0 || height <= 0) {
-        liq_log_error(attr, "width and height must be > 0");
-        return NULL;
-    }
     if (gamma < 0 || gamma > 1.0) {
         liq_log_error(attr, "gamma must be >= 0 and <= 1 (try 1/gamma instead)");
         return NULL;
@@ -531,19 +524,34 @@ LIQ_EXPORT liq_error liq_image_set_memory_ownership(liq_image *img, int ownershi
     return LIQ_OK;
 }
 
+static bool check_image_size(const liq_attr *attr, const int width, const int height)
+{
+    if (!CHECK_STRUCT_TYPE(attr, liq_attr)) {
+        return false;
+    }
+
+    if (width <= 0 || height <= 0) {
+        liq_log_error(attr, "width and height must be > 0");
+        return false;
+    }
+    if (width > INT_MAX/height) {
+        liq_log_error(attr, "image too large");
+        return false;
+    }
+    return true;
+}
+
 LIQ_EXPORT liq_image *liq_image_create_custom(liq_attr *attr, liq_image_get_rgba_row_callback *row_callback, void* user_info, int width, int height, double gamma)
 {
+    if (!check_image_size(attr, width, height)) {
+        return NULL;
+    }
     return liq_image_create_internal(attr, NULL, row_callback, user_info, width, height, gamma);
 }
 
 LIQ_EXPORT liq_image *liq_image_create_rgba_rows(liq_attr *attr, void* rows[], int width, int height, double gamma)
 {
-    if (width <= 0 || height <= 0) {
-        liq_log_error(attr, "width and height must be > 0");
-        return NULL;
-    }
-    if (width > INT_MAX/16/height || height > INT_MAX/16/width) {
-        liq_log_error(attr, "image too large");
+    if (!check_image_size(attr, width, height)) {
         return NULL;
     }
 
@@ -558,13 +566,7 @@ LIQ_EXPORT liq_image *liq_image_create_rgba_rows(liq_attr *attr, void* rows[], i
 
 LIQ_EXPORT liq_image *liq_image_create_rgba(liq_attr *attr, void* bitmap, int width, int height, double gamma)
 {
-    if (!CHECK_STRUCT_TYPE(attr, liq_attr)) return NULL;
-    if (width <= 0 || height <= 0) {
-        liq_log_error(attr, "width and height must be > 0");
-        return NULL;
-    }
-    if (width > INT_MAX/16/height || height > INT_MAX/16/width) {
-        liq_log_error(attr, "image too large");
+    if (!check_image_size(attr, width, height)) {
         return NULL;
     }
     if (!CHECK_USER_POINTER(bitmap)) {
@@ -1404,12 +1406,12 @@ static void adjust_histogram_callback(hist_item *item, float diff)
 
  feedback_loop_trials controls how long the search will take. < 0 skips the iteration.
  */
-static colormap *find_best_palette(histogram *hist, const liq_attr *options, double *palette_error_p)
+static colormap *find_best_palette(histogram *hist, const liq_attr *options, const double max_mse, double *palette_error_p)
 {
     unsigned int max_colors = options->max_colors;
     // if output is posterized it doesn't make sense to aim for perfrect colors, so increase target_mse
     // at this point actual gamma is not set, so very conservative posterization estimate is used
-    const double target_mse = MAX(options->target_mse, pow((1<<options->min_posterization_output)/1024.0, 2));
+    const double target_mse = MIN(max_mse, MAX(options->target_mse, pow((1<<options->min_posterization_output)/1024.0, 2)));
     int feedback_loop_trials = options->feedback_loop_trials;
     colormap *acolormap = NULL;
     double least_error = MAX_DIFF;
@@ -1488,10 +1490,11 @@ static liq_result *pngquant_quantize(histogram *hist, const liq_attr *options, c
 
     // no point having perfect match with imperfect colors (ignorebits > 0)
     const bool fast_palette = options->fast_palette || hist->ignorebits > 0;
+    const bool few_input_colors = hist->size <= options->max_colors;
 
     // If image has few colors to begin with (and no quality degradation is required)
     // then it's possible to skip quantization entirely
-    if (hist->size <= options->max_colors && options->target_mse == 0) {
+    if (few_input_colors && options->target_mse == 0) {
         acolormap = pam_colormap(hist->size, options->malloc, options->free);
         for(unsigned int i=0; i < hist->size; i++) {
             acolormap->palette[i].acolor = hist->achv[i].acolor;
@@ -1499,13 +1502,13 @@ static liq_result *pngquant_quantize(histogram *hist, const liq_attr *options, c
         }
         palette_error = 0;
     } else {
-        acolormap = find_best_palette(hist, options, &palette_error);
+        const double max_mse = options->max_mse * (few_input_colors ? 0.33 : 1.0); // when degrading image that's already paletted, require much higher improvement, since pal2pal often looks bad and there's little gain
+        acolormap = find_best_palette(hist, options, max_mse, &palette_error);
         if (!acolormap) {
             return NULL;
         }
 
         // Voronoi iteration approaches local minimum for the palette
-        const double max_mse = options->max_mse;
         const double iteration_limit = options->voronoi_iteration_limit;
         unsigned int iterations = options->voronoi_iterations;
 
@@ -1525,7 +1528,7 @@ static liq_result *pngquant_quantize(histogram *hist, const liq_attr *options, c
 
                 if (palette_error > max_mse*1.5) { // probably hopeless
                     if (palette_error > max_mse*3.0) break; // definitely hopeless
-                    iterations++;
+                    i++;
                 }
 
                 previous_palette_error = palette_error;
@@ -1634,4 +1637,8 @@ LIQ_EXPORT liq_error liq_write_remapped_image_rows(liq_result *quant, liq_image 
     }
 
     return LIQ_OK;
+}
+
+LIQ_EXPORT int liq_version() {
+    return LIQ_VERSION;
 }

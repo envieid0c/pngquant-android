@@ -43,7 +43,7 @@
 #    define SSE_ALIGN
 #  else
 #    define SSE_ALIGN __attribute__ ((aligned (16)))
-#if  defined(__i386__) && defined(__PIC__)
+#    if defined(__i386__) && defined(__PIC__)
 #       define cpuid(func,ax,bx,cx,dx)\
         __asm__ __volatile__ ( \
         "push %%ebx\n" \
@@ -57,7 +57,6 @@
         __asm__ __volatile__ ("cpuid":\
         "=a" (ax), "=b" (bx), "=c" (cx), "=d" (dx) : "a" (func));
 #    endif
-
 #endif
 #else
 #  define SSE_ALIGN
